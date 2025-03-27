@@ -1,4 +1,5 @@
 ;; GENESIS - Digital Asset Registry Smart Contract
+
 ;; Manages unique digital asset registrations with ownership tracking and metadata management
 
 ;; Custom Error Codes
@@ -196,20 +197,4 @@
       (ok true)
     )
   )
-)
-
-;; Utility Functions for Querying Asset Information
-(define-read-only (get-asset-details (asset-id uint))
-  (let 
-    (
-      (asset-data (map-get? digital-asset-registry { asset-id: asset-id }))
-    )
-    (if (is-some asset-data)
-      (ok (unwrap-panic asset-data))
-      ERROR-ASSET-NOT-FOUND
-    )
-)
-
-(define-read-only (is-hash-registered (asset-hash (buff 32)))
-  (is-some (map-get? registered-asset-hashes { hash: asset-hash }))
 )
