@@ -1,273 +1,215 @@
-;; GenesisLab Smart Contract
-;; A decentralized platform for funding and verifying scientific research
-;; This contract allows:
-;; 1. Scientists to submit research proposals
-;; 2. Community members to fund proposals with STX
-;; 3. Peer review and verification of completed research
-;; 4. Distribution of research findings as NFTs
+;; GENESIS - Digital Asset Registry Smart Contract
+;; Manages unique digital asset registrations with ownership tracking and metadata management
 
-(define-data-var admin principal tx-sender)
-(define-map proposals
-  { proposal-id: uint }
-  {
-    scientist: principal,
-    title: (string-utf8 100),
-    abstract: (string-utf8 500),
-    funding-goal: uint,
-    current-funding: uint,
-    status: (string-utf8 20),  ;; "proposed", "funded", "in-progress", "complete", "verified"
-    ipfs-hash: (optional (string-utf8 46)),
-    reviewers: (list 5 principal)
-  }
+;; Custom Error Codes
+(define-constant ERROR-UNAUTHORIZED-ACTION (err u2000))
+(define-constant ERROR-INVALID-ASSET-HASH (err u2001))
+(define-constant ERROR-ASSET-ALREADY-EXISTS (err u2002))
+(define-constant ERROR-ASSET-NOT-FOUND (err u2003))
+(define-constant ERROR-INVALID-ASSET-ID (err u2004))
+(define-constant ERROR-ASSET-EXPIRED (err u2005))
+(define-constant ERROR-INVALID-EXPIRATION (err u2006))
+
+;; Contract Owner
+(define-data-var contract-administrator principal tx-sender)
+
+;; Asset Registration Tracking
+(define-map digital-asset-registry
+  { asset-id: uint }
+  { creator: principal, registration-time: uint, asset-hash: (buff 32), expiration: (optional uint) }
 )
 
-(define-map funders
-  { proposal-id: uint, funder: principal }
-  { amount: uint }
+;; Hash Uniqueness Tracking
+(define-map registered-asset-hashes
+  { hash: (buff 32) }
+  { asset-id: uint }
 )
 
-(define-map peer-reviews
-  { proposal-id: uint, reviewer: principal }
-  {
-    score: uint,  ;; 1-10
-    comments: (string-utf8 500),
-    verified: bool
-  }
+;; Asset ID Counter
+(define-data-var asset-id-sequence uint u0)
+
+;; Asset Registration Function
+(define-public (register-digital-asset 
+  (asset-hash (buff 32)) 
+  (optional-expiration (optional uint))
 )
-
-(define-non-fungible-token research-findings uint)
-
-(define-data-var proposal-counter uint u0)
-
-;; ====================
-;; Admin functions
-;; ====================
-
-(define-public (set-admin (new-admin principal))
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
-    (ok (var-set admin new-admin))
-  )
-)
-
-;; ====================
-;; Scientist functions
-;; ====================
-
-(define-public (submit-proposal (title (string-utf8 100)) (abstract (string-utf8 500)) (funding-goal uint))
-  (let
-    ((proposal-id (var-get proposal-counter)))
-    (asserts! (> funding-goal u0) (err u400))
-    ;; Using an empty list with the correct type annotation
-    (let ((empty-reviewers (as-max-len? (list) u5)))
-      (map-set proposals
-        { proposal-id: proposal-id }
-        {
-          scientist: tx-sender,
-          title: title,
-          abstract: abstract,
-          funding-goal: funding-goal,
-          current-funding: u0,
-          status: "proposed",
-          ipfs-hash: none,
-          reviewers: (default-to (list) empty-reviewers)
+    ;; Validate input
+    (asserts! (is-eq (len asset-hash) u32) ERROR-INVALID-ASSET-HASH)
+    (asserts! (not (is-eq asset-hash 0x0000000000000000000000000000000000000000000000000000000000000000)) 
+              ERROR-INVALID-ASSET-HASH)
+    (asserts! (is-none (map-get? registered-asset-hashes { hash: asset-hash })) 
+              ERROR-ASSET-ALREADY-EXISTS)
+    
+    ;; Optional expiration validation
+    (asserts! (match optional-expiration
+               expiry (> expiry block-height)
+               true)
+              ERROR-INVALID-EXPIRATION)
+    
+    (let 
+      (
+        (new-asset-id (+ (var-get asset-id-sequence) u1))
+      )
+      ;; Record asset registration
+      (map-set digital-asset-registry 
+        { asset-id: new-asset-id }
+        { 
+          creator: tx-sender, 
+          registration-time: block-height, 
+          asset-hash: asset-hash, 
+          expiration: optional-expiration 
         }
       )
-    )
-    (var-set proposal-counter (+ proposal-id u1))
-    (ok proposal-id)
-  )
-)
-
-(define-public (update-research-status (proposal-id uint) (ipfs-hash (string-utf8 46)))
-  (let
-    (
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) (err u404)))
-    )
-    (asserts! (is-eq tx-sender (get scientist proposal)) (err u403))
-    (asserts! (is-eq (get status proposal) "funded") (err u400))
-    (map-set proposals
-      { proposal-id: proposal-id }
-      (merge proposal {
-        status: "in-progress",
-        ipfs-hash: (some ipfs-hash)
-      })
-    )
-    (ok true)
-  )
-)
-
-(define-public (complete-research (proposal-id uint) (final-ipfs-hash (string-utf8 46)))
-  (let
-    (
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) (err u404)))
-    )
-    (asserts! (is-eq tx-sender (get scientist proposal)) (err u403))
-    (asserts! (is-eq (get status proposal) "in-progress") (err u400))
-    (map-set proposals
-      { proposal-id: proposal-id }
-      (merge proposal {
-        status: "complete",
-        ipfs-hash: (some final-ipfs-hash)
-      })
-    )
-    (ok true)
-  )
-)
-
-;; ====================
-;; Funding functions
-;; ====================
-
-(define-public (fund-proposal (proposal-id uint) (amount uint))
-  (let
-    (
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) (err u404)))
-      (current-funding (get current-funding proposal))
-      (funding-goal (get funding-goal proposal))
-      (updated-funding (+ current-funding amount))
-    )
-    (asserts! (is-eq (get status proposal) "proposed") (err u400))
-    (asserts! (>= amount u1000000) (err u400)) ;; Minimum 1 STX
-    
-    ;; Transfer STX from sender to contract
-    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-    
-    ;; Update funder records
-    (let
-      ((current-amount (default-to u0 (get amount (map-get? funders { proposal-id: proposal-id, funder: tx-sender })))))
-      (map-set funders
-        { proposal-id: proposal-id, funder: tx-sender }
-        {
-          amount: (+ current-amount amount)
-        }
+      
+      ;; Track hash uniqueness
+      (map-set registered-asset-hashes 
+        { hash: asset-hash }
+        { asset-id: new-asset-id }
       )
+      
+      ;; Update asset ID sequence
+      (var-set asset-id-sequence new-asset-id)
+      
+      (ok new-asset-id)
     )
-    
-    ;; Update proposal funding
-    (map-set proposals
-      { proposal-id: proposal-id }
-      (merge proposal {
-        current-funding: updated-funding,
-        status: (if (>= updated-funding funding-goal) "funded" "proposed")
-      })
-    )
-    
-    (ok updated-funding)
   )
 )
 
-;; ====================
-;; Peer review functions
-;; ====================
-
-(define-public (assign-reviewers (proposal-id uint) (reviewers (list 5 principal)))
-  (let
-    (
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) (err u404)))
-    )
-    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
-    (asserts! (is-eq (get status proposal) "complete") (err u400))
-    (map-set proposals
-      { proposal-id: proposal-id }
-      (merge proposal {
-        reviewers: reviewers
-      })
-    )
-    (ok true)
-  )
+;; Asset Transfer Function
+(define-public (transfer-asset-ownership 
+  (asset-id uint) 
+  (new-owner principal)
 )
-
-(define-public (submit-review (proposal-id uint) (score uint) (comments (string-utf8 500)) (verified bool))
-  (let
+  (let 
     (
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) (err u404)))
-      (reviewers (get reviewers proposal))
+      (current-max-id (var-get asset-id-sequence))
+      (asset-data (map-get? digital-asset-registry { asset-id: asset-id }))
     )
-    (asserts! (is-some (index-of reviewers tx-sender)) (err u403))
-    (asserts! (and (>= score u1) (<= score u10)) (err u400))
+    ;; Validate inputs
+    (asserts! (<= asset-id current-max-id) ERROR-INVALID-ASSET-ID)
+    (asserts! (> asset-id u0) ERROR-INVALID-ASSET-ID)
+    (asserts! (is-some asset-data) ERROR-ASSET-NOT-FOUND)
     
-    (map-set peer-reviews
-      { proposal-id: proposal-id, reviewer: tx-sender }
-      {
-        score: score,
-        comments: comments,
-        verified: verified
-      }
-    )
-    
-    ;; Check if sufficient verified reviews exist
-    (if (check-sufficient-verification proposal-id)
-      (begin
-        (try! (mint-research-finding proposal-id))
-        (map-set proposals
-          { proposal-id: proposal-id }
-          (merge proposal {
-            status: "verified"
-          })
-        )
-        (ok true)
+    (let 
+      (
+        (asset-details (unwrap-panic asset-data))
+        (current-time block-height)
       )
+      ;; Check ownership and expiration
+      (asserts! (is-eq tx-sender (get creator asset-details)) ERROR-UNAUTHORIZED-ACTION)
+      (asserts! (or
+                  (is-none (get expiration asset-details))
+                  (< current-time (unwrap-panic (get expiration asset-details)))
+                )
+                ERROR-ASSET-EXPIRED)
+      
+      ;; Update ownership
+      (map-set digital-asset-registry
+        { asset-id: asset-id }
+        (merge asset-details { creator: new-owner })
+      )
+      
       (ok true)
     )
   )
 )
 
-(define-private (check-sufficient-verification (proposal-id uint))
-  (let
+;; Asset Metadata Update Function
+(define-public (update-asset-metadata 
+  (asset-id uint) 
+  (new-hash (buff 32))
+)
+  (let 
     (
-      (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-      (reviewers (get reviewers proposal))
-      (verified-count (fold + u0 (map is-verified-review (map verify-tuple-for-proposal-id reviewers proposal-id))))
+      (current-max-id (var-get asset-id-sequence))
+      (asset-data (map-get? digital-asset-registry { asset-id: asset-id }))
     )
-    (>= verified-count u3) ;; Require at least 3 verified reviews
+    ;; Validate inputs
+    (asserts! (<= asset-id current-max-id) ERROR-INVALID-ASSET-ID)
+    (asserts! (> asset-id u0) ERROR-INVALID-ASSET-ID)
+    (asserts! (is-eq (len new-hash) u32) ERROR-INVALID-ASSET-HASH)
+    (asserts! (is-some asset-data) ERROR-ASSET-NOT-FOUND)
+    
+    (let 
+      (
+        (asset-details (unwrap-panic asset-data))
+        (current-time block-height)
+      )
+      ;; Check ownership and expiration
+      (asserts! (is-eq tx-sender (get creator asset-details)) ERROR-UNAUTHORIZED-ACTION)
+      (asserts! (or
+                  (is-none (get expiration asset-details))
+                  (< current-time (unwrap-panic (get expiration asset-details)))
+                )
+                ERROR-ASSET-EXPIRED)
+      
+      ;; Remove old hash tracking
+      (map-delete registered-asset-hashes { hash: (get asset-hash asset-details) })
+      
+      ;; Update asset details
+      (map-set digital-asset-registry
+        { asset-id: asset-id }
+        (merge asset-details { asset-hash: new-hash })
+      )
+      
+      ;; Track new hash
+      (map-set registered-asset-hashes
+        { hash: new-hash }
+        { asset-id: asset-id }
+      )
+      
+      (ok true)
+    )
   )
 )
 
-(define-private (verify-tuple-for-proposal-id (reviewer principal) (proposal-id uint))
-  {
-    reviewer: reviewer,
-    proposal-id: proposal-id
-  }
+;; Asset Expiration Extension Function
+(define-public (extend-asset-registration 
+  (asset-id uint) 
+  (new-expiration uint)
 )
-
-(define-private (is-verified-review (tuple {reviewer: principal, proposal-id: uint}))
-  (let
+  (let 
     (
-      (review (map-get? peer-reviews { proposal-id: (get proposal-id tuple), reviewer: (get reviewer tuple) }))
+      (current-max-id (var-get asset-id-sequence))
+      (asset-data (map-get? digital-asset-registry { asset-id: asset-id }))
     )
-    (if (and (is-some review) (get verified (unwrap-panic review)))
-      u1
-      u0
+    ;; Validate inputs
+    (asserts! (<= asset-id current-max-id) ERROR-INVALID-ASSET-ID)
+    (asserts! (> asset-id u0) ERROR-INVALID-ASSET-ID)
+    (asserts! (> new-expiration block-height) ERROR-INVALID-EXPIRATION)
+    (asserts! (is-some asset-data) ERROR-ASSET-NOT-FOUND)
+    
+    (let 
+      (
+        (asset-details (unwrap-panic asset-data))
+      )
+      ;; Check ownership
+      (asserts! (is-eq tx-sender (get creator asset-details)) ERROR-UNAUTHORIZED-ACTION)
+      
+      ;; Update expiration
+      (map-set digital-asset-registry
+        { asset-id: asset-id }
+        (merge asset-details { expiration: (some new-expiration) })
+      )
+      
+      (ok true)
     )
   )
 )
 
-;; ====================
-;; NFT functions
-;; ====================
-
-(define-private (mint-research-finding (proposal-id uint))
-  (let
+;; Utility Functions for Querying Asset Information
+(define-read-only (get-asset-details (asset-id uint))
+  (let 
     (
-      (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-      (scientist (get scientist proposal))
+      (asset-data (map-get? digital-asset-registry { asset-id: asset-id }))
     )
-    (nft-mint? research-findings proposal-id scientist)
-  )
+    (if (is-some asset-data)
+      (ok (unwrap-panic asset-data))
+      ERROR-ASSET-NOT-FOUND
+    )
 )
 
-;; Get public information about a proposal
-(define-read-only (get-proposal-info (proposal-id uint))
-  (map-get? proposals { proposal-id: proposal-id })
-)
-
-;; Get funding information
-(define-read-only (get-funding-info (proposal-id uint) (funder principal))
-  (map-get? funders { proposal-id: proposal-id, funder: funder })
-)
-
-;; Get review information
-(define-read-only (get-review-info (proposal-id uint) (reviewer principal))
-  (map-get? peer-reviews { proposal-id: proposal-id, reviewer: reviewer })
+(define-read-only (is-hash-registered (asset-hash (buff 32)))
+  (is-some (map-get? registered-asset-hashes { hash: asset-hash }))
 )
