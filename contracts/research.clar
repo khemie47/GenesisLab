@@ -58,18 +58,21 @@
   (let
     ((proposal-id (var-get proposal-counter)))
     (asserts! (> funding-goal u0) (err u400))
-    (map-set proposals
-      { proposal-id: proposal-id }
-      {
-        scientist: tx-sender,
-        title: title,
-        abstract: abstract,
-        funding-goal: funding-goal,
-        current-funding: u0,
-        status: "proposed",
-        ipfs-hash: none,
-        reviewers: (list)
-      }
+    ;; Using an empty list with the correct type annotation
+    (let ((empty-reviewers (as-max-len? (list) u5)))
+      (map-set proposals
+        { proposal-id: proposal-id }
+        {
+          scientist: tx-sender,
+          title: title,
+          abstract: abstract,
+          funding-goal: funding-goal,
+          current-funding: u0,
+          status: "proposed",
+          ipfs-hash: none,
+          reviewers: (default-to (list) empty-reviewers)
+        }
+      )
     )
     (var-set proposal-counter (+ proposal-id u1))
     (ok proposal-id)
@@ -116,11 +119,10 @@
 ;; Funding functions
 ;; ====================
 
-(define-public (fund-proposal (proposal-id uint))
+(define-public (fund-proposal (proposal-id uint) (amount uint))
   (let
     (
       (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) (err u404)))
-      (amount (unwrap! (get-amount) (err u400)))
       (current-funding (get current-funding proposal))
       (funding-goal (get funding-goal proposal))
       (updated-funding (+ current-funding amount))
@@ -132,11 +134,14 @@
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     
     ;; Update funder records
-    (map-set funders
-      { proposal-id: proposal-id, funder: tx-sender }
-      {
-        amount: (default-to u0 (get amount (map-get? funders { proposal-id: proposal-id, funder: tx-sender }))) + amount
-      }
+    (let
+      ((current-amount (default-to u0 (get amount (map-get? funders { proposal-id: proposal-id, funder: tx-sender })))))
+      (map-set funders
+        { proposal-id: proposal-id, funder: tx-sender }
+        {
+          amount: (+ current-amount amount)
+        }
+      )
     )
     
     ;; Update proposal funding
@@ -150,19 +155,6 @@
     
     (ok updated-funding)
   )
-)
-
-(define-private (get-amount)
-  (let ((amount (get-stx-amount?)))
-    (if (is-some amount)
-      (some (unwrap-panic amount))
-      none
-    )
-  )
-)
-
-(define-private (get-stx-amount?)
-  (contract-call? .stx get-call-amount)
 )
 
 ;; ====================
@@ -226,20 +218,27 @@
     (
       (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
       (reviewers (get reviewers proposal))
-      (verified-count (fold check-reviewer-verified u0 reviewers))
+      (verified-count (fold + u0 (map is-verified-review (map verify-tuple-for-proposal-id reviewers proposal-id))))
     )
     (>= verified-count u3) ;; Require at least 3 verified reviews
   )
 )
 
-(define-private (check-reviewer-verified (reviewer principal) (count uint))
+(define-private (verify-tuple-for-proposal-id (reviewer principal) (proposal-id uint))
+  {
+    reviewer: reviewer,
+    proposal-id: proposal-id
+  }
+)
+
+(define-private (is-verified-review (tuple {reviewer: principal, proposal-id: uint}))
   (let
     (
-      (review (map-get? peer-reviews { proposal-id: (var-get proposal-counter), reviewer: reviewer }))
+      (review (map-get? peer-reviews { proposal-id: (get proposal-id tuple), reviewer: (get reviewer tuple) }))
     )
     (if (and (is-some review) (get verified (unwrap-panic review)))
-      (+ count u1)
-      count
+      u1
+      u0
     )
   )
 )
